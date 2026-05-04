@@ -1,0 +1,6 @@
+{
+  "name": "Editor de NF-e XML",
+  "description": "Uma aplicação para editar, validar e gerar arquivos XML de Nota Fiscal Eletrônica (NF-e) v4.00.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["XML Editing", "File Generation", "Real-time Validation"]
+}

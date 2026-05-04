@@ -1,0 +1,53 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  :root.dark {
+    /* Base Colors mapped to zinc/slate equivalents for dark mode */
+    --color-white: #18181b; /* zinc-900 */
+    --color-gray-50: #09090b; /* zinc-950 */
+    --color-gray-100: #27272a; /* zinc-800 */
+    --color-gray-200: #3f3f46; /* zinc-700 */
+    --color-gray-300: #52525b; /* zinc-600 */
+    --color-gray-400: #71717a; /* zinc-500 */
+    --color-gray-500: #a1a1aa; /* zinc-400 */
+    --color-gray-600: #d4d4d8; /* zinc-300 */
+    --color-gray-700: #e4e4e7; /* zinc-200 */
+    --color-gray-800: #f4f4f5; /* zinc-100 */
+    --color-gray-900: #fafafa; /* zinc-50 */
+    
+    /* Indigo (Primary) */
+    --color-indigo-50: #1e1b4b;
+    --color-indigo-100: #312e81;
+    --color-indigo-400: #818cf8;
+    --color-indigo-600: #6366f1;
+    --color-indigo-700: #a5b4fc;
+    --color-indigo-800: #c7d2fe;
+    --color-indigo-900: #e0e7ff;
+    
+    /* Emerald (Success) */
+    --color-emerald-50: #022c22;
+    --color-emerald-100: #064e3b;
+    --color-emerald-600: #10b981;
+    --color-emerald-700: #6ee7b7;
+    
+    /* Amber (Warning) */
+    --color-amber-50: #451a03;
+    --color-amber-100: #78350f;
+    --color-amber-700: #fcd34d;
+    --color-amber-800: #fde68a;
+    --color-amber-900: #fef3c7;
+    
+    /* Red (Error) */
+    --color-red-50: #450a0a;
+    --color-red-100: #7f1d1d;
+    --color-red-500: #ef4444;
+    --color-red-600: #f87171;
+    --color-red-700: #fca5a5;
+  }
+}
+
