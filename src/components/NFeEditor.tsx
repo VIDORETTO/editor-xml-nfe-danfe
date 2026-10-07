@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useCallback } from 'react';
-import { XMLParser, XMLBuilder } from 'fast-xml-parser';
+import React, { useState, useMemo, useCallback, useEffect, useId } from 'react';
+import { XMLBuilder, XMLParser, XMLValidator } from 'fast-xml-parser';
 import { 
   FileUp, 
   Download, 
@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '@/src/lib/utils';
+import { calculateNfeTotals } from '@/src/lib/nfe-money';
 import { NFeDocument, ValidationError } from '@/src/types/nfe';
 
 // Initial state for a blank NFe
@@ -132,6 +133,8 @@ const BLANK_NFE: NFeDocument = {
   }
 };
 
+const MAX_XML_FILE_SIZE = 10 * 1024 * 1024;
+
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
@@ -149,14 +152,23 @@ const builder = new XMLBuilder({
   indentBy: "  "
 });
 
+const PAYMENT_METHODS = [
+  { v: '01', l: 'Dinheiro' },
+  { v: '02', l: 'Cheque' },
+  { v: '03', l: 'Cartão de Crédito' },
+  { v: '04', l: 'Cartão de Débito' },
+  { v: '15', l: 'Boleto Bancário' },
+  { v: '17', l: 'PIX' },
+  { v: '90', l: 'Sem Pagamento' },
+  { v: '99', l: 'Outros' },
+];
+
 // Helper to pad values
 const padVal = (val: string, length: number) => {
   if (!val) return val;
   const digits = val.replace(/\D/g, '');
-  if (digits.length > 0 && digits.length < length) {
-    return digits.padStart(length, '0');
-  }
-  return val;
+  if (!digits) return val;
+  return digits.length < length ? digits.padStart(length, '0') : digits;
 };
 
 // Helper to clean IE
@@ -195,11 +207,22 @@ const reorderObject = (obj: any, order: string[]) => {
 
 export default function NFeEditor() {
   const [doc, setDoc] = useState<NFeDocument>(BLANK_NFE);
+  const [uploadNotice, setUploadNotice] = useState<{ kind: 'error' | 'success'; text: string } | null>(null);
+  const [calculationNotice, setCalculationNotice] = useState<{ kind: 'error' | 'success'; text: string } | null>(null);
   const [activeTab, setActiveTab] = useState('sobre');
   const [viewXml, setViewTab] = useState<'form' | 'xml'>('form');
   const [isDarkMode, setIsDarkMode] = useState(() => {
     return document.documentElement.classList.contains('dark');
   });
+
+  useEffect(() => {
+    const revealActiveTab = () => {
+      document.getElementById(`mobile-tab-${activeTab}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    };
+    revealActiveTab();
+    window.addEventListener('resize', revealActiveTab);
+    return () => window.removeEventListener('resize', revealActiveTab);
+  }, [activeTab]);
 
   const toggleDarkMode = () => {
     const isDark = document.documentElement.classList.toggle('dark');
@@ -316,30 +339,109 @@ export default function NFeEditor() {
   const errors = useMemo(() => validate(), [validate]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
+    input.value = '';
     if (!file) return;
 
+    setUploadNotice(null);
+    if (file.size > MAX_XML_FILE_SIZE) {
+      setUploadNotice({ kind: 'error', text: 'O arquivo excede o limite de 10 MB.' });
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (event) => {
-      const xml = event.target?.result as string;
-      const jsonObj = parser.parse(xml);
-      
-      // Basic normalization to ensure it's an nfeProc
-      if (jsonObj.NFe && !jsonObj.nfeProc) {
-        setDoc({ nfeProc: { ...jsonObj, "@_xmlns": "http://www.portalfiscal.inf.br/nfe", "@_versao": "4.00" } });
-      } else if (jsonObj.nfeProc) {
-        // Ensure det is an array if multiple items
-        const inf = jsonObj.nfeProc.NFe.infNFe;
-        if (inf.det && !Array.isArray(inf.det)) {
-          inf.det = [inf.det];
+      try {
+        const xml = event.target?.result;
+        if (typeof xml !== 'string' || !xml.trim()) {
+          throw new Error('O arquivo está vazio ou não pôde ser lido como texto.');
         }
-        setDoc(jsonObj);
+
+        const validation = XMLValidator.validate(xml);
+        if (validation !== true) {
+          throw new Error(`O XML está malformado (linha ${validation.err.line}, coluna ${validation.err.col}).`);
+        }
+
+        const parsed = parser.parse(xml);
+        let nfeProc = parsed?.nfeProc;
+        if (!nfeProc && parsed?.NFe) {
+          nfeProc = {
+            ...parsed,
+            '@_xmlns': parsed['@_xmlns'] || 'http://www.portalfiscal.inf.br/nfe',
+            '@_versao': parsed['@_versao'] || '4.00',
+          };
+        }
+
+        const inf = nfeProc?.NFe?.infNFe;
+        if (!inf || typeof inf !== 'object') {
+          throw new Error('O arquivo não contém uma NF-e reconhecível. Selecione um XML completo de NF-e 4.00.');
+        }
+
+        const namespace = nfeProc['@_xmlns'] || nfeProc.NFe['@_xmlns'];
+        if (namespace && namespace !== 'http://www.portalfiscal.inf.br/nfe') {
+          throw new Error('O arquivo usa um namespace XML incompatível com a NF-e.');
+        }
+
+        if (nfeProc['@_versao'] && !['4', '4.00'].includes(String(nfeProc['@_versao']))) {
+          throw new Error(`Versão de processamento ${nfeProc['@_versao']} não é compatível com este editor.`);
+        }
+
+        const missing = [
+          ['Identificação', inf.ide],
+          ['Emitente', inf.emit],
+          ['Endereço do emitente', inf.emit?.enderEmit],
+          ['Destinatário', inf.dest],
+          ['Produtos', inf.det],
+          ['Totais', inf.total?.ICMSTot],
+          ['Transporte', inf.transp],
+          ['Pagamento', inf.pag],
+        ].find(([, value]) => !value || typeof value !== 'object');
+        if (missing) {
+          throw new Error(`A NF-e está incompleta: falta a seção ${missing[0]}.`);
+        }
+
+        if (!['4', '4.00'].includes(String(inf['@_versao'] ?? ''))) {
+          throw new Error(`Versão ${inf['@_versao'] || 'não informada'} não é compatível. Este editor aceita NF-e 4.00.`);
+        }
+        inf['@_versao'] = '4.00';
+        nfeProc['@_xmlns'] ||= 'http://www.portalfiscal.inf.br/nfe';
+        nfeProc['@_versao'] ||= '4.00';
+
+        const details = inf.det ? (Array.isArray(inf.det) ? inf.det : [inf.det]) : [];
+        if (details.length === 0) {
+          throw new Error('A NF-e precisa conter ao menos um produto.');
+        }
+        if (details.some((item: any) => !item?.prod || !item?.imposto)) {
+          throw new Error('A NF-e contém um produto sem os dados de produto ou imposto necessários.');
+        }
+        inf.det = details;
+        const payments = inf.pag.detPag === undefined
+          ? []
+          : Array.isArray(inf.pag.detPag) ? inf.pag.detPag : [inf.pag.detPag];
+        if (payments.some((item: any) => !item || typeof item !== 'object')) {
+          throw new Error('A NF-e contém uma forma de pagamento inválida.');
+        }
+        inf.pag.detPag = payments;
+
+        setDoc({ nfeProc });
+        setCalculationNotice(null);
+        setActiveTab('ide');
+        setUploadNotice({ kind: 'success', text: 'XML carregado no navegador. Os dados permanecem nesta sessão.' });
+      } catch (error) {
+        setUploadNotice({
+          kind: 'error',
+          text: error instanceof Error ? error.message : 'Não foi possível abrir este XML.',
+        });
       }
+    };
+    reader.onerror = () => {
+      setUploadNotice({ kind: 'error', text: 'Não foi possível ler o arquivo XML local.' });
     };
     reader.readAsText(file);
   };
 
   const updateField = (path: string, value: any) => {
+    setCalculationNotice(null);
     setDoc(prev => {
       const next = JSON.parse(JSON.stringify(prev));
       const parts = path.split('.');
@@ -350,6 +452,19 @@ export default function NFeEditor() {
         current = current[parts[i]];
       }
       current[parts[parts.length - 1]] = value;
+      return next;
+    });
+  };
+
+  const updatePaymentField = (index: number, field: 'tPag' | 'vPag', value: string) => {
+    setCalculationNotice(null);
+    setDoc(prev => {
+      const next = JSON.parse(JSON.stringify(prev)) as NFeDocument;
+      const current = next.nfeProc.NFe.infNFe.pag.detPag;
+      const payments = Array.isArray(current) ? current : [current];
+      if (!payments[index]) return prev;
+      payments[index] = { ...payments[index], [field]: value };
+      next.nfeProc.NFe.infNFe.pag.detPag = payments;
       return next;
     });
   };
@@ -429,84 +544,36 @@ export default function NFeEditor() {
     a.href = url;
     a.download = `NFe_${doc.nfeProc.NFe.infNFe.ide.nNF || 'nova'}.xml`;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const calculateTotals = () => {
-    setDoc(prev => {
-      const next = JSON.parse(JSON.stringify(prev));
-      const det = Array.isArray(next.nfeProc.NFe.infNFe.det) 
-        ? next.nfeProc.NFe.infNFe.det 
-        : [next.nfeProc.NFe.infNFe.det].filter(Boolean);
-      
-      let vProd = 0;
-      let vBC = 0;
-      let vICMS = 0;
-      let vIPI = 0;
-      let vPIS = 0;
-      let vCOFINS = 0;
-      let vOutroTotal = 0;
-      let vDescTotal = 0;
-      let vFreteTotal = 0;
-      let vSegTotal = 0;
+    const result = calculateNfeTotals(doc.nfeProc.NFe.infNFe);
+    if (result.ok === false) {
+      setCalculationNotice({ kind: 'error', text: result.message });
+      return;
+    }
 
-      det.forEach((item: any) => {
-        vProd += parseFloat(item.prod.vProd || 0);
-        
-        // Summing taxes from items
-        const icms = item.imposto?.ICMS;
-        if (icms) {
-          // Check various ICMS types (00, 10, 20, etc)
-          const icmsType = Object.keys(icms)[0];
-          if (icmsType && icms[icmsType].vBC) vBC += parseFloat(icms[icmsType].vBC || 0);
-          if (icmsType && icms[icmsType].vICMS) vICMS += parseFloat(icms[icmsType].vICMS || 0);
-        }
-        
-        const ipiTrib = item.imposto?.IPI?.IPITrib;
-        if (ipiTrib) vIPI += parseFloat(ipiTrib.vIPI || 0);
+    const next = JSON.parse(JSON.stringify(doc)) as NFeDocument;
+    const total = next.nfeProc.NFe.infNFe.total.ICMSTot;
+    const { paymentValue, ...totals } = result.totals;
+    Object.assign(total, totals);
 
-        const pisAliq = item.imposto?.PIS?.PISAliq || item.imposto?.PIS?.PISOutr;
-        if (pisAliq) vPIS += parseFloat(pisAliq.vPIS || 0);
+    if (paymentValue !== undefined) {
+      const payments = next.nfeProc.NFe.infNFe.pag.detPag;
+      if (Array.isArray(payments) && payments.length === 1) payments[0].vPag = paymentValue;
+      else if (payments && !Array.isArray(payments)) payments.vPag = paymentValue;
+    }
 
-        const cofinsAliq = item.imposto?.COFINS?.COFINSAliq || item.imposto?.COFINS?.COFINSOutr;
-        if (cofinsAliq) vCOFINS += parseFloat(cofinsAliq.vCOFINS || 0);
-        
-        vOutroTotal += parseFloat(item.prod.vOutro || 0);
-        vDescTotal += parseFloat(item.prod.vDesc || 0);
-        vFreteTotal += parseFloat(item.prod.vFrete || 0);
-        vSegTotal += parseFloat(item.prod.vSeg || 0);
-      });
-
-      const total = next.nfeProc.NFe.infNFe.total.ICMSTot;
-      total.vProd = vProd.toFixed(2);
-      total.vBC = vBC.toFixed(2);
-      total.vICMS = vICMS.toFixed(2);
-      total.vIPI = vIPI.toFixed(2);
-      total.vPIS = vPIS.toFixed(2);
-      total.vCOFINS = vCOFINS.toFixed(2);
-      
-      // If items have individual freight/seg/desc, we could pull them, 
-      // but usually these are set at total level or distributed.
-      // We'll trust the total level fields for these unless user wants sync.
-      
-      const vNF = vProd + vICMS + vIPI + parseFloat(total.vOutro || 0) + parseFloat(total.vFrete || 0) + parseFloat(total.vSeg || 0) - parseFloat(total.vDesc || 0);
-      total.vNF = vNF.toFixed(2);
-
-      if (next.nfeProc.NFe.infNFe.pag?.detPag) {
-        const detPag = Array.isArray(next.nfeProc.NFe.infNFe.pag.detPag) 
-          ? next.nfeProc.NFe.infNFe.pag.detPag 
-          : [next.nfeProc.NFe.infNFe.pag.detPag];
-        
-        if (detPag.length === 1) {
-          detPag[0].vPag = total.vNF;
-        }
-      }
-
-      return next;
+    setDoc(next);
+    setCalculationNotice({
+      kind: 'success',
+      text: 'Totais recalculados com precisão decimal. O cálculo é auxiliar: confira as regras do seu cenário e valide o XML em uma ferramenta fiscal.',
     });
   };
 
   const fixCommonFormatting = () => {
+    setCalculationNotice(null);
     setDoc(prev => {
       const next = JSON.parse(JSON.stringify(prev));
       const inf = next.nfeProc.NFe.infNFe;
@@ -539,8 +606,11 @@ export default function NFeEditor() {
         const icms = item.imposto?.ICMS;
         if (icms) {
           const type = Object.keys(icms)[0];
-          if (type && icms[type].CST) {
-            icms[type].CST = icms[type].CST.length < 2 ? icms[type].CST.padStart(2, '0') : icms[type].CST;
+          if (type && icms[type]?.CST) {
+            icms[type].CST = String(icms[type].CST).padStart(2, '0');
+          }
+          if (type && icms[type]?.CSOSN) {
+            icms[type].CSOSN = String(icms[type].CSOSN).padStart(3, '0');
           }
         }
       });
@@ -562,23 +632,27 @@ export default function NFeEditor() {
     { id: 'infAdic', label: 'Observações', icon: MessageSquare },
     { id: 'fiscal', label: 'Integridade', icon: AlertCircle },
   ];
+  const paymentDetails = Array.isArray(doc.nfeProc.NFe.infNFe.pag.detPag)
+    ? doc.nfeProc.NFe.infNFe.pag.detPag
+    : doc.nfeProc.NFe.infNFe.pag.detPag ? [doc.nfeProc.NFe.infNFe.pag.detPag] : [];
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col font-sans" id="nfe-app">
       {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between sticky top-0 z-50 shadow-sm">
+      <header className="bg-white border-b border-gray-200 px-3 py-3 sm:px-6 sm:py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sticky top-0 z-50 shadow-sm">
         <div className="flex items-center gap-3">
           <div className="bg-indigo-600 p-2 rounded-lg text-white">
             <FileText size={24} />
           </div>
-          <h1 className="text-xl font-bold text-gray-900 tracking-tight">XML NFe Editor</h1>
+          <h1 className="text-base sm:text-xl font-bold text-gray-900 tracking-tight">Editor de XML de NF-e</h1>
         </div>
         
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3">
           <button
             onClick={toggleDarkMode}
             className="flex items-center justify-center w-10 h-10 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 transition-colors border border-gray-200"
             title="Alternar Tema"
+            aria-label="Alternar tema"
           >
             {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
           </button>
@@ -588,6 +662,8 @@ export default function NFeEditor() {
               // Basic template based on common structure
               setDoc(BLANK_NFE);
               setActiveTab('ide');
+              setUploadNotice(null);
+              setCalculationNotice(null);
             }}
             className="hidden md:flex items-center gap-2 px-3 py-2 text-xs font-bold text-indigo-600 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition-all border border-indigo-100"
           >
@@ -596,12 +672,13 @@ export default function NFeEditor() {
 
           <button 
             onClick={() => setViewTab(v => v === 'form' ? 'xml' : 'form')}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+            className="flex items-center gap-2 px-3 sm:px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+            aria-label={viewXml === 'form' ? 'Ver XML' : 'Ver formulário'}
           >
             {viewXml === 'form' ? 'Ver XML' : 'Ver Formulário'}
           </button>
           
-          <label className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 cursor-pointer transition-all shadow-sm hover:shadow-md">
+          <label className="flex items-center gap-2 px-3 sm:px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 cursor-pointer transition-all shadow-sm hover:shadow-md">
             <FileUp size={18} />
             <span>Upload XML</span>
             <input type="file" accept=".xml" className="hidden" onChange={handleFileUpload} />
@@ -609,7 +686,8 @@ export default function NFeEditor() {
           
           <button 
             onClick={downloadXml}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-all shadow-sm hover:shadow-md"
+            className="flex items-center gap-2 px-3 sm:px-4 py-2 text-sm font-medium text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-all shadow-sm hover:shadow-md"
+            aria-label="Baixar XML"
           >
             <Download size={18} />
             <span>Baixar XML</span>
@@ -617,15 +695,39 @@ export default function NFeEditor() {
         </div>
       </header>
 
+      <nav className="lg:hidden hide-scrollbar bg-white border-b border-gray-200 px-3 py-2 overflow-x-auto" aria-label="Seções da nota">
+        <div className="flex w-max min-w-full gap-2">
+          {tabs.map(tab => (
+            <button
+              key={tab.id}
+              id={`mobile-tab-${tab.id}`}
+              aria-current={activeTab === tab.id ? 'page' : undefined}
+              onClick={() => { setActiveTab(tab.id); setViewTab('form'); }}
+              className={cn(
+                'flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors',
+                activeTab === tab.id
+                  ? 'border-indigo-100 bg-indigo-50 text-indigo-700'
+                  : 'border-transparent text-gray-500 hover:bg-gray-50 hover:text-gray-900'
+              )}
+            >
+              <tab.icon size={16} className={activeTab === tab.id ? 'text-indigo-600' : 'text-gray-400'} />
+              <span>{tab.label}</span>
+              {errors.some(error => error.section === tab.id) && <span className="h-2 w-2 rounded-full bg-red-500" aria-label="Aviso nesta seção" />}
+            </button>
+          ))}
+        </div>
+      </nav>
+
       <main className="flex-1 flex overflow-hidden">
         {/* Sidebar Nav */}
-        <nav className="w-64 bg-white border-r border-gray-200 overflow-y-auto hidden lg:block">
+        <nav className="w-64 bg-white border-r border-gray-200 overflow-y-auto hidden lg:block" aria-label="Seções da nota">
           <div className="p-4 space-y-1">
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 px-2">Seções da Nota</p>
             {tabs.map(tab => (
               <button
                 key={tab.id}
                 id={`tab-${tab.id}`}
+                aria-current={activeTab === tab.id ? 'page' : undefined}
                 onClick={() => { setActiveTab(tab.id); setViewTab('form'); }}
                 className={cn(
                   "w-full flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-xl transition-all",
@@ -648,12 +750,30 @@ export default function NFeEditor() {
                 <Info size={16} />
                 <span className="text-xs font-bold uppercase tracking-tighter">Versão 4.00</span>
              </div>
-             <p className="text-[10px] text-gray-400 leading-tight">Suporte completo para a estrutura de esquema da SEFAZ v4.00</p>
+             <p className="text-[10px] text-gray-400 leading-tight">Editor local para o leiaute NF-e 4.00; não substitui validação XSD.</p>
           </div>
         </nav>
 
         {/* content area */}
         <div className="flex-1 overflow-y-auto p-4 md:p-8 bg-gray-50">
+          {(uploadNotice || calculationNotice) && (
+            <div className="max-w-4xl mx-auto space-y-3 mb-6" aria-live="polite">
+              {[uploadNotice, calculationNotice].filter(Boolean).map((notice, index) => (
+                <div
+                  key={`${notice?.kind}-${index}`}
+                  role={notice?.kind === 'error' ? 'alert' : 'status'}
+                  className={cn(
+                    'rounded-xl border px-4 py-3 text-sm font-medium',
+                    notice?.kind === 'error'
+                      ? 'border-red-200 bg-red-50 text-red-800'
+                      : 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                  )}
+                >
+                  {notice?.text}
+                </div>
+              ))}
+            </div>
+          )}
           <AnimatePresence mode="wait">
             {viewXml === 'xml' ? (
               <motion.div 
@@ -687,8 +807,8 @@ export default function NFeEditor() {
                 className="max-w-4xl mx-auto space-y-8 pb-20"
               >
                 {/* Section Title */}
-                <div className="flex items-baseline justify-between gap-4">
-                   <h2 className="text-3xl font-extrabold text-gray-900 tracking-tight">
+                <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-2 sm:gap-4">
+                   <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">
                      {tabs.find(t => t.id === activeTab)?.label}
                    </h2>
                    <p className="text-gray-400 text-sm italic">Preencha os campos abaixo de acordo com o padrão SEFAZ</p>
@@ -714,7 +834,7 @@ export default function NFeEditor() {
                         </div>
                         <h4 className="text-xl font-bold text-gray-900">O que é e para que serve?</h4>
                         <p className="text-gray-500 text-sm leading-relaxed">
-                          Este aplicativo é um editor de XML especializado em Nota Fiscal Eletrônica (NF-e). Sua principal função é permitir que usuários corrijam erros comuns de formatação (como a perda de zeros à esquerda em CNPJs, IEs e IPIs) que impedem a importação correta de arquivos em sistemas de gestão (ERPs) como o <strong>Bling</strong>.
+                          Este aplicativo é um editor local de XML de Nota Fiscal Eletrônica (NF-e). Ele ajuda a revisar campos, ajustar a formatação de identificadores e preparar um arquivo para análise ou importação em um sistema de gestão.
                         </p>
                       </div>
 
@@ -741,7 +861,7 @@ export default function NFeEditor() {
                                 Limpeza Automática
                              </h5>
                              <p className="text-xs text-gray-500 mt-2 leading-relaxed">
-                                O app remove automaticamente caracteres especiais e pontuações de campos sensíveis como CNPJ e Inscrição Estadual, garantindo que apenas números sejam exportados, conforme exigido pelo schema da SEFAZ.
+                                O botão de correção remove pontuação de campos selecionados, como CNPJ e Inscrição Estadual. Revise os dados antes de exportar.
                              </p>
                           </div>
                           <div className="p-5 bg-gray-50 rounded-2xl border border-gray-100">
@@ -750,7 +870,7 @@ export default function NFeEditor() {
                                 Reordenação de Tags
                              </h5>
                              <p className="text-xs text-gray-500 mt-2 leading-relaxed">
-                                Ao baixar o XML, o editor organiza as tags na ordem exata exigida pelos validadores XSD da Receita Federal, evitando erros de "Estrutura Inválida" em seu ERP.
+                                Ao baixar o XML, o editor organiza os principais grupos de tags. A estrutura não passa por validação XSD completa; confira o arquivo em uma ferramenta fiscal antes de importar.
                              </p>
                           </div>
                        </div>
@@ -861,15 +981,15 @@ export default function NFeEditor() {
                           Endereço do Destinatário
                        </h3>
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                          <FormField label="Logradouro" value={doc.nfeProc.NFe.infNFe.dest.enderDest.xLgr} onChange={v => updateField('dest.enderDest.xLgr', v)} className="md:col-span-2" />
-                          <FormField label="Número" value={doc.nfeProc.NFe.infNFe.dest.enderDest.nro} onChange={v => updateField('dest.enderDest.nro', v)} />
-                          <FormField label="Complemento" value={doc.nfeProc.NFe.infNFe.dest.enderDest.xCpl} onChange={v => updateField('dest.enderDest.xCpl', v)} />
-                          <FormField label="Bairro" value={doc.nfeProc.NFe.infNFe.dest.enderDest.xBairro} onChange={v => updateField('dest.enderDest.xBairro', v)} />
-                          <FormField label="CEP" value={doc.nfeProc.NFe.infNFe.dest.enderDest.CEP} onChange={v => updateField('dest.enderDest.CEP', v)} />
-                          <FormField label="Cidade" value={doc.nfeProc.NFe.infNFe.dest.enderDest.xMun} onChange={v => updateField('dest.enderDest.xMun', v)} />
-                          <FormField label="Cód. Município" value={doc.nfeProc.NFe.infNFe.dest.enderDest.cMun} onChange={v => updateField('dest.enderDest.cMun', v)} />
-                          <FormField label="UF" value={doc.nfeProc.NFe.infNFe.dest.enderDest.UF} onChange={v => updateField('dest.enderDest.UF', v)} />
-                          <FormField label="Telefone" value={doc.nfeProc.NFe.infNFe.dest.enderDest.fone} onChange={v => updateField('dest.enderDest.fone', v)} />
+                          <FormField label="Logradouro" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.xLgr} onChange={v => updateField('dest.enderDest.xLgr', v)} className="md:col-span-2" />
+                          <FormField label="Número" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.nro} onChange={v => updateField('dest.enderDest.nro', v)} />
+                          <FormField label="Complemento" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.xCpl} onChange={v => updateField('dest.enderDest.xCpl', v)} />
+                          <FormField label="Bairro" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.xBairro} onChange={v => updateField('dest.enderDest.xBairro', v)} />
+                          <FormField label="CEP" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.CEP} onChange={v => updateField('dest.enderDest.CEP', v)} />
+                          <FormField label="Cidade" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.xMun} onChange={v => updateField('dest.enderDest.xMun', v)} />
+                          <FormField label="Cód. Município" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.cMun} onChange={v => updateField('dest.enderDest.cMun', v)} />
+                          <FormField label="UF" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.UF} onChange={v => updateField('dest.enderDest.UF', v)} />
+                          <FormField label="Telefone" value={doc.nfeProc.NFe.infNFe.dest.enderDest?.fone} onChange={v => updateField('dest.enderDest.fone', v)} />
                         </div>
                     </div>
                   </div>
@@ -896,15 +1016,20 @@ export default function NFeEditor() {
                           index={idx} 
                           onRemove={() => removeProduct(idx)}
                           onChange={(field, value) => {
-                             const det = Array.isArray(doc.nfeProc.NFe.infNFe.det) ? [...doc.nfeProc.NFe.infNFe.det] : [doc.nfeProc.NFe.infNFe.det];
-                             const parts = field.split('.');
-                             let curr = det[idx];
-                             for(let i=0; i<parts.length-1; i++) {
-                               if(!curr[parts[i]]) curr[parts[i]] = {};
-                               curr = curr[parts[i]];
-                             }
-                             curr[parts[parts.length-1]] = value;
-                             setDoc(prev => ({ ...prev, nfeProc: { ...prev.nfeProc, NFe: { ...prev.nfeProc.NFe, infNFe: { ...prev.nfeProc.NFe.infNFe, det } } } }));
+                             setCalculationNotice(null);
+                             setDoc(prev => {
+                               const current = prev.nfeProc.NFe.infNFe.det;
+                               const det = (Array.isArray(current) ? current : [current]).map(item => JSON.parse(JSON.stringify(item)));
+                               if (!det[idx]) return prev;
+                               const parts = field.split('.');
+                               let curr = det[idx];
+                               for (let i = 0; i < parts.length - 1; i++) {
+                                 if (!curr[parts[i]]) curr[parts[i]] = {};
+                                 curr = curr[parts[i]];
+                               }
+                               curr[parts[parts.length - 1]] = value;
+                               return { ...prev, nfeProc: { ...prev.nfeProc, NFe: { ...prev.nfeProc.NFe, infNFe: { ...prev.nfeProc.NFe.infNFe, det } } } };
+                             });
                           }}
                         />
                       ))}
@@ -1012,24 +1137,32 @@ export default function NFeEditor() {
                   <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500" id="section-pag">
                     <div className="bg-white p-8 rounded-2xl border border-gray-200 space-y-6 shadow-sm">
                       <h3 className="font-bold text-gray-800 flex items-center gap-2 text-lg">Informações de Pagamento</h3>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <FormField 
-                          label="Forma de Pagamento" 
-                          value={doc.nfeProc.NFe.infNFe.pag.detPag.tPag} 
-                          onChange={(v:any) => updateField('pag.detPag.tPag', v)}
-                          select={[
-                            {v: '01', l: 'Dinheiro'},
-                            {v: '02', l: 'Cheque'},
-                            {v: '03', l: 'Cartão de Crédito'},
-                            {v: '04', l: 'Cartão de Débito'},
-                            {v: '15', l: 'Boleto Bancário'},
-                            {v: '17', l: 'PIX'},
-                            {v: '90', l: 'Sem Pagamento'},
-                            {v: '99', l: 'Outros'},
-                          ]}
-                        />
-                        <FormField label="Valor Pagamento" value={doc.nfeProc.NFe.infNFe.pag.detPag.vPag} onChange={(v:any) => updateField('pag.detPag.vPag', v)} inputClassName="font-bold text-gray-900" />
-                      </div>
+                      {paymentDetails.map((payment: any, index: number) => (
+                        <div key={index} className="grid grid-cols-1 md:grid-cols-2 gap-6 rounded-xl border border-gray-100 bg-gray-50 p-5">
+                          <FormField
+                            label={`Forma de Pagamento ${index + 1}`}
+                            value={payment.tPag}
+                            onChange={(value: string) => updatePaymentField(index, 'tPag', value)}
+                            select={[
+                              ...(payment.tPag && !PAYMENT_METHODS.some(option => option.v === String(payment.tPag))
+                                ? [{ v: String(payment.tPag), l: `Código ${payment.tPag} (original)` }]
+                                : []),
+                              ...PAYMENT_METHODS,
+                            ]}
+                          />
+                          <FormField
+                            label={`Valor Pagamento ${index + 1}`}
+                            value={payment.vPag}
+                            onChange={(value: string) => updatePaymentField(index, 'vPag', value)}
+                            inputClassName="font-bold text-gray-900"
+                          />
+                        </div>
+                      ))}
+                      {paymentDetails.length === 0 && (
+                        <p className="rounded-xl border border-gray-200 bg-gray-50 p-4 text-sm text-gray-500">
+                          Este arquivo não informa detalhes de pagamento.
+                        </p>
+                      )}
                     </div>
                   </div>
                 )}
@@ -1082,8 +1215,9 @@ export default function NFeEditor() {
                       <h3 className="font-bold text-gray-800 flex items-center gap-2 text-lg">Informações Adicionais</h3>
                       <div className="space-y-6">
                         <div className="space-y-1.5">
-                          <label className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">Informações Complementares (infCpl)</label>
+                          <label htmlFor="infCpl" className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">Informações Complementares (infCpl)</label>
                           <textarea 
+                            id="infCpl"
                             value={doc.nfeProc.NFe.infNFe.infAdic?.infCpl || ''} 
                             onChange={e => updateField('infAdic.infCpl', e.target.value)}
                             rows={6}
@@ -1092,8 +1226,9 @@ export default function NFeEditor() {
                           />
                         </div>
                         <div className="space-y-1.5">
-                          <label className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">Informações do Fisco (infAdFisco)</label>
+                          <label htmlFor="infAdFisco" className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">Informações do Fisco (infAdFisco)</label>
                           <textarea 
+                            id="infAdFisco"
                             value={doc.nfeProc.NFe.infNFe.infAdic?.infAdFisco || ''} 
                             onChange={e => updateField('infAdic.infAdFisco', e.target.value)}
                             rows={3}
@@ -1111,7 +1246,7 @@ export default function NFeEditor() {
                        <div className="flex items-center justify-between">
                          <div>
                             <h3 className="text-xl font-bold text-gray-900">Diagnóstico de Integridade Fiscal</h3>
-                            <p className="text-sm text-gray-500 mt-1">Análise técnica baseada em padrões SEFAZ e importação (Bling)</p>
+                            <p className="text-sm text-gray-500 mt-1">Verificações locais de campos e formatação; não substituem a validação XSD ou a autorização da SEFAZ.</p>
                          </div>
                          <button 
                            onClick={fixCommonFormatting}
@@ -1158,7 +1293,7 @@ export default function NFeEditor() {
                        </div>
 
                        <div className="bg-indigo-50 p-6 rounded-2xl border border-indigo-100">
-                          <h4 className="font-black text-indigo-900 uppercase text-xs tracking-widest mb-4">Relatório de Diagnóstico (Importação Bling)</h4>
+                          <h4 className="font-black text-indigo-900 uppercase text-xs tracking-widest mb-4">Relatório de Diagnóstico Local</h4>
                           <ul className="space-y-3">
                              <li className="flex items-start gap-2 text-sm text-indigo-800">
                                 <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 mt-1.5 shrink-0" />
@@ -1196,6 +1331,7 @@ export default function NFeEditor() {
 }
 
 function FormField({ label, value, onChange, type = "text", select, className, inputClassName, numericOnly }: any) {
+  const controlId = useId();
   const handleChange = (val: string) => {
     if (numericOnly) {
       onChange(val.replace(/\D/g, ''));
@@ -1206,9 +1342,10 @@ function FormField({ label, value, onChange, type = "text", select, className, i
 
   return (
     <div className={cn("space-y-1.5", className)}>
-      <label className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">{label}</label>
+      <label htmlFor={controlId} className="text-[11px] font-bold text-gray-400 uppercase tracking-widest pl-1">{label}</label>
       {select ? (
         <select 
+          id={controlId}
           value={value} 
           onChange={e => handleChange(e.target.value)}
           className={cn(
@@ -1220,6 +1357,7 @@ function FormField({ label, value, onChange, type = "text", select, className, i
         </select>
       ) : (
         <input 
+          id={controlId}
           type={type} 
           value={value || ''} 
           onChange={e => handleChange(e.target.value)}
@@ -1235,46 +1373,59 @@ function FormField({ label, value, onChange, type = "text", select, className, i
 
 function ProductItem({ item, index, onRemove, onChange }: any) {
   const [isOpen, setIsOpen] = useState(false);
+  const variantAllowsEdit = (group: any, editableVariant: string) => {
+    const variants = Object.keys(group ?? {});
+    return variants.length === 0 || (variants.length === 1 && variants[0] === editableVariant);
+  };
+  const canEditIpi = variantAllowsEdit(item.imposto?.IPI, 'IPITrib');
+  const canEditIcms = variantAllowsEdit(item.imposto?.ICMS, 'ICMS00');
+  const canEditPis = variantAllowsEdit(item.imposto?.PIS, 'PISAliq');
+  const canEditCofins = variantAllowsEdit(item.imposto?.COFINS, 'COFINSAliq');
   
   return (
     <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden group">
-      <div 
-        className={cn(
-          "px-6 py-4 flex items-center justify-between cursor-pointer hover:bg-gray-50 transition-colors",
-          isOpen && "bg-gray-50/50 border-b border-gray-100"
-        )}
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        <div className="flex items-center gap-4">
-          <div className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center text-xs font-bold text-gray-500">
-             {index + 1}
-          </div>
-          <div>
-            <h4 className="font-bold text-gray-800 text-sm">{item.prod.xProd || "Produto sem nome"}</h4>
-            <div className="flex items-center gap-3 text-[10px] uppercase font-bold tracking-tighter text-gray-400 mt-0.5">
-               <span>Cód: {item.prod.cProd}</span>
-               <span className="bg-gray-200 w-1 h-1 rounded-full" />
-               <span>Quantidade: {item.prod.qCom} {item.prod.uCom}</span>
+      <div className={cn(
+        "px-4 sm:px-6 py-4 flex items-center gap-3 hover:bg-gray-50 transition-colors",
+        isOpen && "bg-gray-50/50 border-b border-gray-100"
+      )}>
+        <button
+          type="button"
+          aria-expanded={isOpen}
+          onClick={() => setIsOpen(!isOpen)}
+          className="min-w-0 flex-1 flex items-center justify-between gap-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded-lg"
+        >
+          <div className="min-w-0 flex items-center gap-3 sm:gap-4">
+            <div className="w-8 h-8 shrink-0 rounded-full bg-gray-100 flex items-center justify-center text-xs font-bold text-gray-500">
+               {index + 1}
+            </div>
+            <div className="min-w-0">
+              <h4 className="font-bold text-gray-800 text-sm truncate">{item.prod.xProd || "Produto sem nome"}</h4>
+              <div className="flex flex-wrap items-center gap-x-3 text-[10px] uppercase font-bold tracking-tighter text-gray-400 mt-0.5">
+                 <span>Cód: {item.prod.cProd}</span>
+                 <span className="bg-gray-200 w-1 h-1 rounded-full" />
+                 <span>Quantidade: {item.prod.qCom} {item.prod.uCom}</span>
+              </div>
             </div>
           </div>
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="text-right hidden sm:block">
-            <p className="text-xs font-bold text-gray-900">R$ {item.prod.vProd}</p>
-            <p className="text-[10px] text-gray-400">CFOP {item.prod.CFOP}</p>
+          <div className="flex shrink-0 items-center gap-2 sm:gap-4">
+            <div className="text-right hidden sm:block">
+              <p className="text-xs font-bold text-gray-900">R$ {item.prod.vProd}</p>
+              <p className="text-[10px] text-gray-400">CFOP {item.prod.CFOP}</p>
+            </div>
+            <div className={cn("p-1 text-gray-400 transition-transform duration-300", isOpen && "rotate-180")}>
+              <ChevronDown size={20} />
+            </div>
           </div>
-          <div className="flex items-center gap-1">
-             <button 
-              onClick={(e) => { e.stopPropagation(); onRemove(); }}
-              className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
-             >
-                <Trash2 size={16} />
-             </button>
-             <div className={cn("p-1 text-gray-400 transition-transform duration-300", isOpen && "rotate-180")}>
-                <ChevronDown size={20} />
-             </div>
-          </div>
-        </div>
+        </button>
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`Remover ${item.prod.xProd || `produto ${index + 1}`}`}
+          title="Remover produto"
+          className="shrink-0 p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+        >
+          <Trash2 size={16} />
+        </button>
       </div>
       
       <AnimatePresence>
@@ -1301,38 +1452,41 @@ function ProductItem({ item, index, onRemove, onChange }: any) {
               
               <div className="pt-6 border-t border-gray-100">
                 <h5 className="text-[11px] font-black text-indigo-500 uppercase tracking-widest mb-4">IPI (Imposto sobre Produtos Industrializados)</h5>
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
+                {canEditIpi ? <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
                   <FormField label="CST IPI" value={item.imposto.IPI?.IPITrib?.CST || "99"} onChange={(v:any) => onChange('imposto.IPI.IPITrib.CST', v)} />
                   <FormField label="Código Enquadramento" value={item.imposto.IPI?.cEnq || "999"} onChange={(v:any) => onChange('imposto.IPI.cEnq', v)} />
                   <FormField label="Base IPI" value={item.imposto.IPI?.IPITrib?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.IPI.IPITrib.vBC', v)} />
                   <FormField label="Alíquota IPI %" value={item.imposto.IPI?.IPITrib?.pIPI || "0.00"} onChange={(v:any) => onChange('imposto.IPI.IPITrib.pIPI', v)} />
                   <FormField label="Valor IPI" value={item.imposto.IPI?.IPITrib?.vIPI || "0.00"} onChange={(v:any) => onChange('imposto.IPI.IPITrib.vIPI', v)} />
-                </div>
+                </div> : <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">A variante IPI deste item não é editável aqui. O XML original será preservado.</p>}
               </div>
 
               <div className="pt-6 border-t border-gray-100">
                 <h5 className="text-[11px] font-black text-indigo-500 uppercase tracking-widest mb-4">Impostos do Item (ICMS/ST)</h5>
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
+                {canEditIcms ? <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
                   <FormField label="Origem" value={item.imposto.ICMS?.ICMS00?.orig || "0"} onChange={(v:any) => onChange('imposto.ICMS.ICMS00.orig', v)} select={[{v:'0', l:'Nacional'}, {v:'1', l:'Estrangeira'}]} />
                   <FormField label="CST ICMS" value={item.imposto.ICMS?.ICMS00?.CST || "00"} onChange={(v:any) => onChange('imposto.ICMS.ICMS00.CST', v)} />
                   <FormField label="Base de Cálculo" value={item.imposto.ICMS?.ICMS00?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.ICMS.ICMS00.vBC', v)} />
                   <FormField label="Aliquota %" value={item.imposto.ICMS?.ICMS00?.pICMS || "0.00"} onChange={(v:any) => onChange('imposto.ICMS.ICMS00.pICMS', v)} />
                   <FormField label="Valor ICMS" value={item.imposto.ICMS?.ICMS00?.vICMS || "0.00"} onChange={(v:any) => onChange('imposto.ICMS.ICMS00.vICMS', v)} />
-                </div>
+                </div> : <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">A variante ICMS deste item não é editável aqui. O XML original será preservado.</p>}
               </div>
               
               <div className="pt-6 border-t border-gray-100">
                 <h5 className="text-[11px] font-black text-indigo-500 uppercase tracking-widest mb-4">PIS / COFINS</h5>
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
-                  <FormField label="CST PIS" value={item.imposto.PIS?.PISAliq?.CST || "01"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.CST', v)} />
-                  <FormField label="Base PIS" value={item.imposto.PIS?.PISAliq?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.vBC', v)} />
-                  <FormField label="Alíquota PIS %" value={item.imposto.PIS?.PISAliq?.pPIS || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.pPIS', v)} />
-                  <FormField label="Valor PIS" value={item.imposto.PIS?.PISAliq?.vPIS || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.vPIS', v)} />
-                  
-                  <FormField label="CST COFINS" value={item.imposto.COFINS?.COFINSAliq?.CST || "01"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.CST', v)} />
-                  <FormField label="Base COFINS" value={item.imposto.COFINS?.COFINSAliq?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.vBC', v)} />
-                  <FormField label="Alíquota COFINS %" value={item.imposto.COFINS?.COFINSAliq?.pCOFINS || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.pCOFINS', v)} />
-                  <FormField label="Valor COFINS" value={item.imposto.COFINS?.COFINSAliq?.vCOFINS || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.vCOFINS', v)} />
+                <div className="space-y-4">
+                  {canEditPis ? <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
+                    <FormField label="CST PIS" value={item.imposto.PIS?.PISAliq?.CST || "01"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.CST', v)} />
+                    <FormField label="Base PIS" value={item.imposto.PIS?.PISAliq?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.vBC', v)} />
+                    <FormField label="Alíquota PIS %" value={item.imposto.PIS?.PISAliq?.pPIS || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.pPIS', v)} />
+                    <FormField label="Valor PIS" value={item.imposto.PIS?.PISAliq?.vPIS || "0.00"} onChange={(v:any) => onChange('imposto.PIS.PISAliq.vPIS', v)} />
+                  </div> : <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">A variante PIS deste item não é editável aqui. O XML original será preservado.</p>}
+                  {canEditCofins ? <div className="grid grid-cols-1 md:grid-cols-4 gap-6 bg-indigo-50/30 p-6 rounded-2xl border border-indigo-100/50">
+                    <FormField label="CST COFINS" value={item.imposto.COFINS?.COFINSAliq?.CST || "01"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.CST', v)} />
+                    <FormField label="Base COFINS" value={item.imposto.COFINS?.COFINSAliq?.vBC || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.vBC', v)} />
+                    <FormField label="Alíquota COFINS %" value={item.imposto.COFINS?.COFINSAliq?.pCOFINS || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.pCOFINS', v)} />
+                    <FormField label="Valor COFINS" value={item.imposto.COFINS?.COFINSAliq?.vCOFINS || "0.00"} onChange={(v:any) => onChange('imposto.COFINS.COFINSAliq.vCOFINS', v)} />
+                  </div> : <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">A variante COFINS deste item não é editável aqui. O XML original será preservado.</p>}
                 </div>
               </div>
 
